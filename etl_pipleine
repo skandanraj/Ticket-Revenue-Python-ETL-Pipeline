@@ -1,0 +1,334 @@
+"""
+Ticket Revenue Reconciliation ETL Pipeline
+------------------------------------------
+
+This script implements a Python-based ETL (Extract, Transform, Load) pipeline
+that reconciles ticketing system data with revenue records.
+
+The objective of this pipeline is to determine whether a support ticket
+resulted in a revenue-generating service by matching ticket information
+with billing data.
+
+Workflow Overview
+-----------------
+1. Extract
+   - Load ticket data and revenue data from Excel files.
+
+2. Transform
+   - Clean column names and convert date fields.
+   - Aggregate multiple test records per ticket.
+   - Match revenue records with tickets using:
+        a) UHID (primary identifier)
+        b) Phone number (fallback identifier)
+   - Ensure invoice date occurs after ticket creation.
+
+3. Load
+   - Generate a final Excel report with two sheets:
+        • Raw Data: Combined ticket and revenue dataset
+        • Validation: Fields used to verify matching accuracy
+
+4. Validation
+   - Add Excel formulas to validate:
+        • UHID matching
+        • Phone number matching
+        • Branch matching
+        • Date consistency
+
+Input Files
+-----------
+- Tickets.xlsx   : Ticketing system dataset
+- Revenue.xlsx   : Billing / revenue dataset
+
+Output File
+-----------
+- App_Tickets_With_Revenue.xlsx
+
+Technologies Used
+-----------------
+- Python
+- Pandas
+- OpenPyXL
+- Excel Automation
+"""
+
+import pandas as pd
+from openpyxl import load_workbook
+
+
+# =========================================================
+# FILE PATHS
+# =========================================================
+# Input datasets and output file location.
+# These paths assume the repository structure:
+#
+# project-root/
+# ├── data/
+# │   ├── Tickets.xlsx
+# │   └── Revenue.xlsx
+# ├── output/
+# │   └── App_Tickets_With_Revenue.xlsx
+#
+
+ticket_input = r"input folder path/Tickets.xlsx"
+revenue_input = r"input folder path/Revenue.xlsx"
+final_output = r"output folder path/App_Tickets_With_Revenue.xlsx"
+
+
+# =========================================================
+# LOAD AND PREPARE TICKET DATA
+# =========================================================
+
+# Read ticket dataset
+tickets = pd.read_excel(ticket_input)
+
+# Remove unwanted spaces from column names
+tickets.columns = tickets.columns.str.strip()
+
+# Convert ticket creation time to datetime
+tickets["Created At"] = pd.to_datetime(tickets["Created At"])
+
+# Keep only relevant columns required for processing
+tickets = tickets[[
+    "Ticket Id", "Contact Name", "UHID", "Phone No",
+    "Branch", "Source", "Priority", "Status",
+    "Created At", "test_id", "test_name"
+]]
+
+
+# =========================================================
+# AGGREGATE MULTIPLE TEST ENTRIES PER TICKET
+# =========================================================
+# A single ticket may contain multiple tests.
+# This step consolidates all tests into one row per ticket.
+
+tickets = (
+    tickets.groupby("Ticket Id", as_index=False)
+    .agg({
+        "Contact Name": "first",
+        "UHID": "first",
+        "Phone No": "first",
+        "Branch": "first",
+        "Source": "first",
+        "Priority": "first",
+        "Status": "first",
+        "Created At": "first",
+
+        # Combine multiple test IDs into a comma-separated list
+        "test_id": lambda x: ", ".join(x.astype(str).unique()),
+
+        # Combine multiple test names into a comma-separated list
+        "test_name": lambda x: ", ".join(x.astype(str).unique())
+    })
+)
+
+print("Tickets loaded:", len(tickets))
+
+
+# =========================================================
+# LOAD REVENUE DATA
+# =========================================================
+# This dataset contains billing records that will be matched
+# with ticket records to determine revenue attribution.
+
+revenue = pd.read_excel(revenue_input)
+
+# Clean column names
+revenue.columns = revenue.columns.str.strip()
+
+# Convert invoice date to datetime
+revenue["InvoiceDate"] = pd.to_datetime(revenue["InvoiceDate"])
+
+
+# =========================================================
+# FUNCTION: MATCH REVENUE PER TICKET
+# =========================================================
+# Matching logic:
+#
+# 1. If UHID exists → match using RegistrationNo
+# 2. If UHID missing → fallback to Phone Number
+#
+# Additional rules:
+# - Branch must match
+# - Invoice date must be after ticket creation date
+# - If multiple matches exist, choose the earliest invoice
+
+def match_revenue(ticket):
+
+    uhid = ticket["UHID"]
+    phone = ticket["Phone No"]
+    branch = ticket["Branch"]
+    created = ticket["Created At"]
+
+    # Convert ticket row to dictionary
+    output = ticket.to_dict()
+
+    # -----------------------------------------------------
+    # Match using UHID
+    # -----------------------------------------------------
+    if pd.notna(uhid) and str(uhid).strip() != "":
+
+        candidates = revenue[
+            (revenue["RegistrationNo"] == uhid) &
+            (revenue["Source_Branch"] == branch) &
+            (revenue["InvoiceDate"] >= created)
+        ]
+
+        match_type = "UHID"
+
+    # -----------------------------------------------------
+    # Fallback matching using Phone Number
+    # -----------------------------------------------------
+    else:
+
+        candidates = revenue[
+            (revenue["Phone No"] == phone) &
+            (revenue["Source_Branch"] == branch) &
+            (revenue["InvoiceDate"] >= created)
+        ]
+
+        match_type = "PHONE"
+
+    # -----------------------------------------------------
+    # If a matching revenue record is found
+    # -----------------------------------------------------
+    if not candidates.empty:
+
+        # Select earliest invoice after ticket creation
+        best = candidates.sort_values("InvoiceDate").iloc[0]
+
+        output.update({
+            "InvoiceNo": best.get("InvoiceNo"),
+            "RegistrationNo": best.get("RegistrationNo"),
+            "Revenue Phone No": best.get("Phone No"),
+            "PatientName": best.get("PatientName"),
+            "Source_Branch": best.get("Source_Branch"),
+            "InvoiceDate": best.get("InvoiceDate"),
+            "Service Name": best.get("Service Name"),
+            "Gross Amount": best.get("Gross Amount"),
+            "Match_Type": match_type
+        })
+
+    # -----------------------------------------------------
+    # If no revenue match found
+    # -----------------------------------------------------
+    else:
+
+        output.update({
+            "InvoiceNo": pd.NA,
+            "RegistrationNo": pd.NA,
+            "Revenue Phone No": pd.NA,
+            "PatientName": pd.NA,
+            "Source_Branch": pd.NA,
+            "InvoiceDate": pd.NA,
+            "Service Name": pd.NA,
+            "Gross Amount": pd.NA,
+            "Match_Type": "NO MATCH"
+        })
+
+    return pd.Series(output)
+
+
+# =========================================================
+# APPLY MATCHING FUNCTION TO ALL TICKETS
+# =========================================================
+final_df = tickets.apply(match_revenue, axis=1)
+
+# Rename ticket phone column for clarity
+final_df = final_df.rename(columns={"Phone No": "Ticket Phone No"})
+
+
+# =========================================================
+# RAW DATA SHEET
+# =========================================================
+# This sheet contains the complete ticket + revenue dataset
+
+raw_df = final_df[[
+    "Ticket Id",
+    "Contact Name",
+    "UHID",
+    "Ticket Phone No",
+    "Branch",
+    "Priority",
+    "Status",
+    "test_id",
+    "test_name",
+    "Created At",
+    "InvoiceNo",
+    "RegistrationNo",
+    "Revenue Phone No",
+    "PatientName",
+    "Source_Branch",
+    "InvoiceDate",
+    "Service Name",
+    "Gross Amount",
+    "Match_Type"
+]]
+
+
+# =========================================================
+# VALIDATION SHEET
+# =========================================================
+# Used for auditing the correctness of revenue matching
+
+validation_df = raw_df[[
+    "Ticket Id",
+    "UHID",
+    "RegistrationNo",
+    "Ticket Phone No",
+    "Revenue Phone No",
+    "Branch",
+    "Source_Branch",
+    "Created At",
+    "InvoiceDate",
+    "Gross Amount"
+]]
+
+
+# =========================================================
+# WRITE OUTPUT TO EXCEL
+# =========================================================
+with pd.ExcelWriter(final_output, engine="openpyxl") as writer:
+    raw_df.to_excel(writer, sheet_name="Raw Data", index=False)
+    validation_df.to_excel(writer, sheet_name="Validation", index=False)
+
+
+# =========================================================
+# ADD VALIDATION FORMULAS IN EXCEL
+# =========================================================
+# These formulas allow quick verification of the matching logic
+
+wb = load_workbook(final_output)
+ws = wb["Validation"]
+
+ws["K1"] = "Test UHID"
+ws["L1"] = "Test Phone No"
+ws["M1"] = "Test Branch"
+ws["N1"] = "Test Date"
+
+for row in range(2, ws.max_row + 1):
+
+    # UHID comparison
+    ws[f"K{row}"] = f'=IF(B{row}=C{row},"YES","NO")'
+
+    # Phone number comparison
+    ws[f"L{row}"] = f'=IF(D{row}=E{row},"YES","NO")'
+
+    # Branch comparison
+    ws[f"M{row}"] = f'=IF(F{row}=G{row},"YES","NO")'
+
+    # Check if invoice date is after ticket creation
+    ws[f"N{row}"] = f'=IF(H{row}<=I{row},"YES","NO")'
+
+
+# Save Excel file
+wb.save(final_output)
+
+
+# =========================================================
+# EXECUTION SUMMARY
+# =========================================================
+print("Script executed successfully")
+print("Sheet 1: Raw Data")
+print("Sheet 2: Validation")
+print("Rows:", len(raw_df))
+print("Output:", final_output)
