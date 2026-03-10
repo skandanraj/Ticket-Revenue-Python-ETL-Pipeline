@@ -264,5 +264,3 @@ This pipeline helps operations and analytics teams:
 
 **Skanda N Raj**
 
-Data Analytics & Automation Project  
-Built using **Python for operational data reconciliation**
